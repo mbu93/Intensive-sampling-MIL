@@ -1,23 +1,27 @@
+from typing import Dict, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
 from sklearn.neighbors import NearestNeighbors
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 from tqdm import tqdm
 
-class WSI_dataset(Dataset):
 
+class WSI_dataset(Dataset):
     def __init__(self, wsi, coords, size, patch_size):
         self.patch_size = patch_size
         self.coords = coords
         self.wsi = wsi
-        self.roi_transforms = transforms.Compose([
-            transforms.Resize(size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-        ])
+        self.roi_transforms = transforms.Compose(
+            [
+                transforms.Resize(size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ]
+        )
 
     def __len__(self):
         return len(self.coords)
@@ -30,14 +34,11 @@ class WSI_dataset(Dataset):
 
 
 class Attn_Net_Gated(nn.Module):
-    def __init__(self, L=1024, D=256, dropout=False, n_classes=1):
+    def __init__(self, L: int = 1024, D: int = 256, dropout: bool = False, n_classes: int = 1):
         super(Attn_Net_Gated, self).__init__()
-        self.attention_a = [
-            nn.Linear(L, D),
-            nn.Tanh()]
+        self.attention_a = [nn.Linear(L, D), nn.Tanh()]
 
-        self.attention_b = [nn.Linear(L, D),
-                            nn.Sigmoid()]
+        self.attention_b = [nn.Linear(L, D), nn.Sigmoid()]
         if dropout:
             self.attention_a.append(nn.Dropout(0.25))
             self.attention_b.append(nn.Dropout(0.25))
@@ -47,82 +48,76 @@ class Attn_Net_Gated(nn.Module):
 
         self.attention_c = nn.Linear(D, n_classes)
 
-    def forward(self, x):
+    def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
         a = self.attention_a(x)
         b = self.attention_b(x)
         A = a.mul(b)
         A = self.attention_c(A)  # N x n_classes
         return A, x
 
-class Branch(nn.Module):
 
-    def __init__(self, features_size, n_classes, k_sample=3, subtyping=False):
+class Branch(nn.Module):
+    def __init__(
+        self, features_size: int, n_classes: int, k_sample: int = 3, subtyping: bool = False
+    ):
         super(Branch, self).__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(features_size, 512),
-            nn.ReLU(),
-            nn.Dropout(0.25)
-        )
+        self.mlp = nn.Sequential(nn.Linear(features_size, 512), nn.ReLU(), nn.Dropout(0.25))
 
         self.attention_net = Attn_Net_Gated(512, 256, dropout=True)
 
-        self.classifier = nn.Linear(512, n_classes)
+        self.classifier: nn.Module = nn.Linear(512, n_classes)
         self.instance_classifiers = nn.ModuleList([nn.Linear(512, 2) for i in range(n_classes)])
+        self.cur_clf = self.instance_classifiers[0]
         self.k_sample = k_sample
         self.instance_loss_fn = nn.CrossEntropyLoss()
         self.n_classes = n_classes
         self.subtyping = subtyping
 
-    def forward(self, x, label=None, inst_inference=True):
+    def forward(
+        self, x: torch.Tensor, label: torch.Tensor = torch.tensor(-1.0), inst_inference: bool = True
+    ) -> Dict[str, torch.Tensor]:
         device = x.device
 
         # attention based MIL
         h = self.mlp(x)
-        A, h = self.attention_net(h) # A: n * 1 h: n * 512
+        A, h = self.attention_net(h)  # A: n * 1 h: n * 512
         A_soft = torch.softmax(A, dim=0)
-        M = torch.mm(torch.transpose(A_soft, 1, 0), h) # 1 * 512
+        M = torch.mm(torch.transpose(A_soft, 1, 0), h)  # 1 * 512
         logits = self.classifier(M)
 
-        res = {
-            'logits': logits,
-            'attention_raw': A,
-            'M': M
-        }
+        res = {'logits': logits, 'attention_raw': A, 'M': M}
 
         if inst_inference:
             # instance classify
             inst_logits = self.classifier(h)
             res['inst_logits'] = inst_logits
 
-
         # CLAM_Branch
-        if label is not None:
+        if label >= 0:
             total_inst_loss = 0.0
             inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze()  # binarize label
-            for i in range(len(self.instance_classifiers)):
+            for i, clf in enumerate(self.instance_classifiers):
                 inst_label = inst_labels[i].item()
-                classifier = self.instance_classifiers[i]
                 if inst_label == 1:
-                    instance_loss = self.inst_eval(A, h, classifier)
-                else:
-                    continue
-
-                total_inst_loss += instance_loss
-            res['inst_loss'] = total_inst_loss
+                    self.cur_clf = clf
+                    instance_loss = self.inst_eval(A, h)
+                    total_inst_loss += instance_loss
+            res['inst_loss'] = torch.tensor(total_inst_loss)
 
         return res
 
     @staticmethod
-    def create_positive_targets(length, device):
+    def create_positive_targets(length: int, device: torch.device):
         return torch.full((length,), 1, device=device).long()
 
     @staticmethod
-    def create_negative_targets(length, device):
+    def create_negative_targets(length: int, device: torch.device):
         return torch.full((length,), 0, device=device).long()
 
-    def inst_eval(self, A, h, classifier):
+    def inst_eval(self, A, h) -> torch.Tensor:
         device = h.device
         A = A.squeeze()
+        classifier = self.cur_clf
 
         if len(h) < 10 * self.k_sample:
             k = 1
@@ -143,17 +138,22 @@ class Branch(nn.Module):
 
 
 class ISMIL(nn.Module):
-
-    def __init__(self, features_size, n_classes, topk=3, threshold=0.5, neighk=24):
+    def __init__(
+        self,
+        features_size: int,
+        n_classes: int,
+        topk: int = 3,
+        threshold: int = 0.5,
+        neighk: int = 24,
+    ):
         super(ISMIL, self).__init__()
-        self.topk=topk
+        self.topk = topk
         self.threshold = threshold
         self.neighk = neighk
 
         self.branch_1 = Branch(features_size, n_classes)
         self.branch_2 = Branch(features_size, n_classes)
         self.classifier = nn.Linear(1024, n_classes)
-
 
     def compute_inst_probs(self, inst_logits, attention_raw):
         return torch.sigmoid(attention_raw.squeeze()) * torch.softmax(inst_logits, dim=-1)[:, 1]
@@ -164,7 +164,7 @@ class ISMIL(nn.Module):
         index = torch.unique(torch.cat([topk_index, over_threshold_index]))
         return coords[index.cpu().numpy()]
 
-    def forward(self, x1, x2, coords1, coords2, label=None):
+    def forward_(self, x1, x2, coords1, coords2, label=None):
         res_1 = self.branch_1(x1, label)
 
         inst_logits, attention_raw = res_1['inst_logits'], res_1['attention_raw']
@@ -182,15 +182,10 @@ class ISMIL(nn.Module):
         M = torch.cat([res_1['M'], res_2['M']], dim=-1)
         logits = self.classifier(M)
 
-        res = {
-            'logits_3': logits,
-            'logits_1': res_1['logits'],
-            'logits_2': res_2['logits']
-        }
+        res = {'logits_3': logits, 'logits_1': res_1['logits'], 'logits_2': res_2['logits']}
 
         if label is not None:
             res['inst_loss'] = res_1['inst_loss']
-
 
         return res
 
@@ -202,15 +197,20 @@ class ISMIL(nn.Module):
             inst_probs = self.compute_inst_probs(inst_logits, A)
             roi_coords = self.compute_coords(inst_probs, coords)
 
-
             mark = {}
             sampled_coords = []
             for coord in roi_coords:
                 coord_x, coord_y = coord
-                for a in range(coord_x-patch_size//2, coord_x + patch_size//2, patch_size // sample_num):
+                for a in range(
+                    coord_x - patch_size // 2, coord_x + patch_size // 2, patch_size // sample_num
+                ):
                     if a not in mark:
                         mark[a] = set()
-                    for b in range(coord_y-patch_size//2, coord_y + patch_size//2, patch_size // sample_num):
+                    for b in range(
+                        coord_y - patch_size // 2,
+                        coord_y + patch_size // 2,
+                        patch_size // sample_num,
+                    ):
                         if b not in mark[a]:
                             sampled_coords.append([a, b])
                             mark[a].add(b)
@@ -235,8 +235,4 @@ class ISMIL(nn.Module):
             logits = self.classifier(M)
             probs = torch.softmax(logits, dim=-1)
 
-            return {
-                'probs': probs,
-                'inst_probs': inst_probs,
-                'coords': coords
-            }
+            return {'probs': probs, 'inst_probs': inst_probs, 'coords': coords}
