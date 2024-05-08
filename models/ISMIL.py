@@ -156,7 +156,12 @@ class ISMIL(nn.Module):
         self.classifier = nn.Linear(1024, n_classes)
 
     def compute_inst_probs(self, inst_logits, attention_raw):
-        return torch.sigmoid(attention_raw.squeeze()) * torch.softmax(inst_logits, dim=-1)[:, 1]
+        buff = torch.zeros_like(inst_logits)
+        for i in range(inst_logits.shape[1]):
+            buff[:, i] = (
+                torch.sigmoid(attention_raw.squeeze()) * torch.softmax(inst_logits, dim=-1)[:, i]
+            )
+        return buff
 
     def compute_coords(self, inst_probs, coords):
         topk_index = torch.topk(inst_probs, k=min(self.topk, len(inst_probs)))[1]
