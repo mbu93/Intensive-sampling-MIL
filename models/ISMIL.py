@@ -1,5 +1,3 @@
-from typing import Dict, Tuple
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,7 +32,7 @@ class WSI_dataset(Dataset):
 
 
 class Attn_Net_Gated(nn.Module):
-    def __init__(self, L: int = 1024, D: int = 256, dropout: bool = False, n_classes: int = 1):
+    def __init__(self, L=1024, D=256, dropout=False, n_classes=1):
         super(Attn_Net_Gated, self).__init__()
         self.attention_a = [nn.Linear(L, D), nn.Tanh()]
 
@@ -48,7 +46,7 @@ class Attn_Net_Gated(nn.Module):
 
         self.attention_c = nn.Linear(D, n_classes)
 
-    def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x):
         a = self.attention_a(x)
         b = self.attention_b(x)
         A = a.mul(b)
@@ -57,25 +55,22 @@ class Attn_Net_Gated(nn.Module):
 
 
 class Branch(nn.Module):
-    def __init__(
-        self, features_size: int, n_classes: int, k_sample: int = 3, subtyping: bool = False
-    ):
+    def __init__(self, features_size, n_classes, k_sample=3, subtyping=False):
         super(Branch, self).__init__()
         self.mlp = nn.Sequential(nn.Linear(features_size, 512), nn.ReLU(), nn.Dropout(0.25))
 
         self.attention_net = Attn_Net_Gated(512, 256, dropout=True)
 
-        self.classifier: nn.Module = nn.Linear(512, n_classes)
-        self.instance_classifiers = nn.ModuleList([nn.Linear(512, 2) for i in range(n_classes)])
-        self.cur_clf = self.instance_classifiers[0]
+        self.classifier = nn.Linear(512, n_classes)
+        self.instance_classifiers: nn.ModuleList = nn.ModuleList(
+            [nn.Linear(512, 2) for i in range(n_classes)]
+        )
         self.k_sample = k_sample
         self.instance_loss_fn = nn.CrossEntropyLoss()
         self.n_classes = n_classes
         self.subtyping = subtyping
 
-    def forward(
-        self, x: torch.Tensor, label: torch.Tensor = torch.tensor(-1.0), inst_inference: bool = True
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, x, label=None, inst_inference=True):
         device = x.device
 
         # attention based MIL
@@ -93,31 +88,45 @@ class Branch(nn.Module):
             res['inst_logits'] = inst_logits
 
         # CLAM_Branch
-        if label >= 0:
+        if label is not None:
             total_inst_loss = 0.0
             inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze()  # binarize label
             for i, clf in enumerate(self.instance_classifiers):
                 inst_label = inst_labels[i].item()
+                classifier = clf
                 if inst_label == 1:
-                    self.cur_clf = clf
-                    instance_loss = self.inst_eval(A, h)
-                    total_inst_loss += instance_loss
-            res['inst_loss'] = torch.tensor(total_inst_loss)
+                    instance_loss = self.inst_eval(A, h, classifier)
+                else:
+                    continue
+
+                total_inst_loss += instance_loss
+            res['inst_loss'] = total_inst_loss
 
         return res
 
     @staticmethod
     def create_positive_targets(length: int, device: torch.device):
-        return torch.full((length,), 1, device=device).long()
+        return torch.full(
+            [
+                int(length),
+            ],
+            1,
+            device=device,
+        ).long()
 
     @staticmethod
     def create_negative_targets(length: int, device: torch.device):
-        return torch.full((length,), 0, device=device).long()
+        return torch.full(
+            [
+                int(length),
+            ],
+            0,
+            device=device,
+        ).long()
 
-    def inst_eval(self, A, h) -> torch.Tensor:
+    def inst_eval(self, A, h, classifier):
         device = h.device
         A = A.squeeze()
-        classifier = self.cur_clf
 
         if len(h) < 10 * self.k_sample:
             k = 1
@@ -138,14 +147,7 @@ class Branch(nn.Module):
 
 
 class ISMIL(nn.Module):
-    def __init__(
-        self,
-        features_size: int,
-        n_classes: int,
-        topk: int = 3,
-        threshold: int = 0.5,
-        neighk: int = 24,
-    ):
+    def __init__(self, features_size, n_classes, topk=3, threshold=0.5, neighk=24):
         super(ISMIL, self).__init__()
         self.topk = topk
         self.threshold = threshold
@@ -169,7 +171,7 @@ class ISMIL(nn.Module):
         index = torch.unique(torch.cat([topk_index, over_threshold_index]))
         return coords[index.cpu().numpy()]
 
-    def forward_(self, x1, x2, coords1, coords2, label=None):
+    def forward(self, x1, x2, coords1, coords2, label=None):
         res_1 = self.branch_1(x1, label)
 
         inst_logits, attention_raw = res_1['inst_logits'], res_1['attention_raw']
