@@ -1,8 +1,10 @@
+from typing import Dict, Optional
+
 import numpy as np
+from sklearn.neighbors import NearestNeighbors
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
@@ -70,7 +72,7 @@ class Branch(nn.Module):
         self.n_classes = n_classes
         self.subtyping = subtyping
 
-    def forward(self, x, label=None, inst_inference=True):
+    def forward(self, x, inst_inference: bool=True) -> Dict[str, torch.Tensor]:
         device = x.device
 
         # attention based MIL
@@ -87,20 +89,6 @@ class Branch(nn.Module):
             inst_logits = self.classifier(h)
             res['inst_logits'] = inst_logits
 
-        # CLAM_Branch
-        if label is not None:
-            total_inst_loss = 0.0
-            inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze()  # binarize label
-            for i, clf in enumerate(self.instance_classifiers):
-                inst_label = inst_labels[i].item()
-                classifier = clf
-                if inst_label == 1:
-                    instance_loss = self.inst_eval(A, h, classifier)
-                else:
-                    continue
-
-                total_inst_loss += instance_loss
-            res['inst_loss'] = total_inst_loss
 
         return res
 
@@ -171,30 +159,6 @@ class ISMIL(nn.Module):
         index = torch.unique(torch.cat([topk_index, over_threshold_index]))
         return coords[index.cpu().numpy()]
 
-    def forward(self, x1, x2, coords1, coords2, label=None):
-        res_1 = self.branch_1(x1, label)
-
-        inst_logits, attention_raw = res_1['inst_logits'], res_1['attention_raw']
-        inst_probs = self.compute_inst_probs(inst_logits, attention_raw)
-        roi_coords = self.compute_coords(inst_probs, coords1)
-
-        neigh = NearestNeighbors(n_neighbors=min(24, len(x2)))
-        neigh.fit(coords2.cpu().numpy())
-        query_index = neigh.kneighbors(roi_coords.cpu().numpy())[1]
-        query_index = np.unique(query_index.flatten())
-
-        x2 = x2[query_index]
-        res_2 = self.branch_2(x2, inst_inference=False)
-
-        M = torch.cat([res_1['M'], res_2['M']], dim=-1)
-        logits = self.classifier(M)
-
-        res = {'logits_3': logits, 'logits_1': res_1['logits'], 'logits_2': res_2['logits']}
-
-        if label is not None:
-            res['inst_loss'] = res_1['inst_loss']
-
-        return res
 
     def patch_probs(self, x, coords, wsi, patch_size, feature_extractor, sample_num=3, **kwargs):
         with torch.no_grad():
